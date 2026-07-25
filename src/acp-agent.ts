@@ -199,6 +199,9 @@ const TURN_NO_RESULT_MESSAGE =
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
 
+/** Extension method returning the caller-requested claude.ai rate-limit windows. */
+const USAGE_METHOD = "_claude/usage";
+
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
  *  contract. `now` pre-empts the current generation and handles the message
@@ -250,6 +253,28 @@ function parseSteerRequest(params: unknown): SteerRequest {
     sessionId,
     prompt: prompt as PromptRequest["prompt"],
   };
+}
+
+/** Params of a {@link USAGE_METHOD} request: the rate-limit window keys the
+ *  caller wants back, e.g. `["five_hour", "seven_day"]`. */
+export type UsageRequest = {
+  keys: string[];
+};
+
+/** The requested rate-limit windows, each straight from the SDK's structured
+ *  /usage data. A key the SDK does not report is absent from the object. */
+export type UsageResponse = Record<string, unknown>;
+
+/** Validate raw JSON-RPC params into a {@link UsageRequest}. */
+function parseUsageRequest(params: unknown): UsageRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "usage params must be an object");
+  }
+  const { keys } = params as Record<string, unknown>;
+  if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) {
+    throw RequestError.invalidParams(undefined, "usage params require a keys array of strings");
+  }
+  return { keys };
 }
 
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
@@ -1283,6 +1308,40 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+  }
+
+  /**
+   * Returns the caller-requested rate-limit windows straight from the SDK's
+   * structured /usage data. The caller passes the keys it wants (e.g. `["five_hour",
+   * "seven_day"]`) and gets back `{ [key]: rate_limits[key] }` — key selection and
+   * labelling stay entirely on the caller. An unfed `Pushable` holds the ephemeral
+   * query open long enough to issue the get_usage request.
+   */
+  async readUsage({ keys }: UsageRequest): Promise<UsageResponse> {
+    const usageQuery = query({
+      prompt: new Pushable<SDKUserMessage>(),
+      options: {
+        pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+      },
+    });
+
+    try {
+      const { rate_limits } =
+        await usageQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+
+      // null whenever plan limits don't apply — API key, Bedrock, Vertex.
+      if (!rate_limits) {
+        return {};
+      }
+
+      const windows = rate_limits as Record<string, unknown>;
+
+      return Object.fromEntries(
+        keys.filter((key) => key in windows).map((key) => [key, windows[key]]),
+      );
+    } finally {
+      usageQuery.close();
+    }
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -7439,6 +7498,9 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<UsageRequest, UsageResponse>(USAGE_METHOD, { parse: parseUsageRequest }, (ctx) =>
+      agent.readUsage(ctx.params),
     )
     .connect(stream);
 
